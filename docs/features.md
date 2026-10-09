@@ -1,6 +1,6 @@
 # Features
 
-Everything runs through a single in-game menu, which **M** opens. It has eight tabs: **Player**, **Travel**, **Vehicles**, **Crew**, **NPCs**, **Build**, **Squadron 42**, **Menu**. The Squadron 42 tab was written for this repository. The other seven come from upstream ChrisWareOffline 0.9.0-rc1.
+Everything runs through a single in-game menu, which **M** opens. It has nine tabs: **Player**, **Travel**, **Vehicles**, **Crew**, **NPCs**, **Build**, **Squadron 42**, **Menu**, **DEV**. Squadron 42 and DEV were added during development; the other seven come from upstream ChrisWareOffline 0.9.0-rc1.
 
 Most of the lists below are plain text files in `data/`, and the counts are taken from those files. Remove lines from a file and its list gets shorter. See [data-files.md](data-files.md).
 
@@ -56,6 +56,14 @@ The first time you open the tab, it shows a spoiler warning. **OK** opens the ta
 ## Menu
 
 Background image settings. Save a picture as `data/menu_background.png` (or `.jpg`), then restart the game. This tab sets how dark the background is and where the image sits.
+
+## Natural mining
+
+Nearby natural ore becomes mineable automatically in the supported offline game build. No DEV switch is required. Use normal mining controls to highlight, scan, fracture and extract. See [natural-mining.md](natural-mining.md) for build compatibility and current validation status.
+
+## DEV
+
+Optional troubleshooting tools: spawn/remove a known mining fixture, inspect natural markers and capture a 30-second mining trace. Automatic mining status is shown here; the tools do not need to be used for normal mining. See [dev-mining.md](dev-mining.md).
 
 ## Logging
 

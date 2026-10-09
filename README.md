@@ -8,9 +8,13 @@ An offline single-player mod menu for **Star Citizen**. You can spawn ships, NPC
 > This mod may get your account banned. Use it at your own risk, and **only offline, in single player**.
 
 > [!NOTE]
-> Builds from this repository are compiled and checked by CI, but **nobody has played them in game yet**. That includes the current Latest release. If something breaks, see [Troubleshooting](#troubleshooting).
+> This is the `junikka/sc-offline-mining` development fork. Natural mining was confirmed in game with the manual experiment, saved as `mining-working-manual`. Automatic startup has passed local builds and automated tests and awaits an in-game run. See [Natural mining](docs/natural-mining.md).
 
 ![A Vanduul holding a gun on a desert planet, with a line of Vanduul and a large ship behind it](images/screenshot.webp)
+
+## Mining development
+
+Buildable code is in `source_code/` at the repository root. Follow [build instructions](docs/build.md); local playable output is installed in `compiled/`. Research, binaries, logs and personal runtime state remain on disk outside Git. The [working savepoint](MINING-SAVEPOINT.md) is preserved before the automatic-startup cleanup. The upstream setup and release links below remain for reference; their releases do not contain this fork's mining changes.
 
 ## What you need
 

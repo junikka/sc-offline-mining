@@ -10,6 +10,7 @@
 #include "npc.h"
 #include "build.h"
 #include "dev.h"
+#include "mining.h"
 #include "cvars.h"
 #include "missions.h"
 #include "contracts.h"
@@ -107,6 +108,7 @@ static void StartOffline() {
         ResolveContractsApi(g_text, g_rdata);
         ResolveAmmoApi(g_text);
         ResolveHangarsApi(g_text, g_rdata);
+        ResolveMiningApi();
         ResolveDevApi();
     }
 }

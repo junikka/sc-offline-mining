@@ -1,5 +1,7 @@
 # Building, checks, CI and releases
 
+This development repository keeps the buildable tree in `source_code/`. Run the commands below from that directory. Compiled outputs, local research and personal runtime state are excluded from Git. The tested manual mining version is tagged `mining-working-manual`; see [Natural mining](natural-mining.md) for validation and rollback details.
+
 ## Build on Windows
 
 1. Install **Visual Studio 2026** with the **Desktop development with C++** workload. The projects use the `v145` toolset. On VS 2022, retarget them to `v143` first (Project → Retarget).
@@ -13,7 +15,10 @@
 
 Release builds link the C runtime statically, so they don't need the Visual C++ redistributable installed.
 
-No Visual Studio? CI builds both on every push to `main`. Download the `dinput8-release` artifact from [Actions](https://github.com/scubamount/sc-offline/actions).
+For DEV mining diagnostics and the VS 2022 direct-project build commands
+(including the standalone lifecycle test), see [DEV mining](dev-mining.md).
+
+This repository currently uses local builds. The upstream [Actions](https://github.com/scubamount/sc-offline/actions) artifacts do not include this branch's mining changes.
 
 ## Check on macOS or Linux
 
@@ -23,9 +28,9 @@ tools/check.sh
 
 This runs in a few seconds. It parses every `src/*.cpp` and `launcher/*.cpp` file with clang against mingw-w64's Windows headers. It also screens `src/` for MSVC error C2712 (`__try` in a function that owns an object needing unwinding, such as a `std::string`). It is not a build: only MSVC's build is. Known clang-only diagnostics are listed in `tools/check-baseline.txt`, and only new ones fail the check. You need clang and mingw-w64 (`brew install llvm mingw-w64` on macOS).
 
-## CI
+## Upstream CI reference
 
-[`.github/workflows/build.yml`](../.github/workflows/build.yml) runs on pushes to `main`, on pull requests, and on `v*` tags:
+The retained [workflow](../source_code/.github/workflows/build.yml) describes upstream builds on pushes to `main`, pull requests and `v*` tags. It sits under `source_code/.github/` in this repository, so GitHub does not run it here. Its upstream jobs are:
 
 1. `check` runs `tools/check.sh` on Linux.
 2. `build` runs MSVC Release x64 on Windows and uploads `dinput8-release`.
@@ -33,7 +38,7 @@ This runs in a few seconds. It parses every `src/*.cpp` and `launcher/*.cpp` fil
 
 Every action is pinned to a commit SHA. The workflow defaults to `contents: read`, and only the `release` job gets `contents: write`.
 
-## Release policy
+## Upstream release policy
 
 - `v1.x` tags publish as full releases. Every other tag publishes as a **pre-release**.
 - A maintainer can promote a pre-release to Latest with `gh release edit <tag> --prerelease=false --latest`. **That can happen before anyone has played the build.** When it does, the release notes and the CHANGELOG say the build is untested.
@@ -43,7 +48,7 @@ To see the current state, check [Releases](https://github.com/scubamount/sc-offl
 
 ## The prebuilt DLL
 
-The `dinput8.dll` at the repo root is the original author's prebuilt build. It came from a tree that was never published, and it is **not** built from `src/`.
+The original distribution included the author's prebuilt `dinput8.dll`, described below. That binary is not tracked in this repository. Use a build from `source_code/src/` for the mining changes.
 
 | | |
 | --- | --- |

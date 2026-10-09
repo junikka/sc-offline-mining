@@ -5,19 +5,12 @@
 #include "npc.h"
 #include "patches.h"
 #include "hooks.h"
-#include "cvars.h"
-#include <atomic>
-#include <intrin.h>
-#include <bcrypt.h>
 #include <cmath>
 #include <cstdarg>
-
-#pragma comment(lib, "bcrypt.lib")
 
 // Validated against the executable and native callers documented in docs/dev-mining.md.
 // These are deliberately build-specific. A different executable disables the native
 // adapter and offset-based diagnostics; the existing generic spawner remains usable.
-static constexpr char kGameHash[] = "3953f8b1a9894d5d9d1836e50939b726141f1829fe65a3a622d5acb2c6f89162";
 static constexpr const char* kRocks[] = { "MineableRock_SurfaceCommon_Iron", "MineableRock_FPS_Hadanite" };
 struct EntryId { uint64_t value = 0; uint32_t type = 0, extra = 0; };
 static_assert(sizeof(EntryId) == 16);
@@ -61,300 +54,6 @@ static DWORD g_traceAt = 0;
 static EntryId g_contactId;
 static uint64_t g_registeredBanks[8] = {};
 static int g_registeredCount = 0;
-// Only the harvestable branch of ScatterGeneratorCPU::QueuePatchPromotion.
-// Keep the instruction intact and replace one comparison immediate atomically.
-static constexpr uint8_t kNaturalGate[] = { 0x80, 0xbc, 0x24, 0xa0, 0x03, 0, 0, 0, 0x0f, 0x84, 0xd0, 0x01, 0, 0 };
-static struct { uint8_t* gate = nullptr; const uint8_t* editor = nullptr; const uint8_t* online = nullptr; const uint8_t* server = nullptr; bool restoreFailed = false; } g_natural;
-
-// Observers installed during startup, before entering the universe. All hooks
-// call the original exactly once. Only the separate nearby-spawning experiment
-// may add bit 8 to eligible cell work; all other arguments/results are preserved.
-// Workers only count/copy POD; the main-thread tick writes the bounded samples.
-namespace NaturalProbe {
-using PromotionFn = void(__fastcall*)(uintptr_t);
-using ObjectFn = uintptr_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-using RequestFn = bool(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-using CheckFn = bool(__fastcall*)(uintptr_t, uintptr_t, uintptr_t);
-using BiomeBuildFn = void(__fastcall*)(uintptr_t, uintptr_t, uint32_t);
-using BiomeCellFn = void(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t, uint64_t, uint8_t);
-using BiomeInstanceFn = void(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, int, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-static PromotionFn promotion = nullptr;
-static ObjectFn object = nullptr;
-static RequestFn request = nullptr;
-static CheckFn check = nullptr;
-static BiomeBuildFn biomeBuild = nullptr;
-static BiomeCellFn biomeCell = nullptr;
-static BiomeInstanceFn biomeInstance = nullptr;
-static PromotionFn biomeJob = nullptr;
-static constexpr unsigned completeMask = 0xff;
-static unsigned installed = 0;
-static std::atomic<bool> active{false}, nearbyEnabled{false}, nearbyFaulted{false};
-static std::atomic<uint64_t> jobs{0}, objects{0}, kinds[8]{}, withGeometry{0}, faults{0};
-static std::atomic<uint64_t> requests{0}, promotionRequests{0}, accepted{0}, rejected{0}, unchecked{0}, afterCheck{0}, dropped{0};
-static std::atomic<uint64_t> biomeBuilds{0}, biomeBuildWithSpawn{0}, biomeCells{0}, biomeCellWithSpawn{0}, biomeNearCells{0};
-static std::atomic<uint64_t> biomeModes[4]{}, biomeOtherModes{0}, biomeRequests{0}, biomeDropped{0};
-static std::atomic<uint64_t> biomeJobs{0}, biomeJobsWithSpawn{0}, biomeJobsEligible{0}, biomeJobsBlocked{0}, biomePromoted{0};
-static thread_local unsigned promotionDepth = 0;
-static thread_local unsigned biomeDepth = 0;
-struct Sample {
-    uint64_t providerHandle = 0, definition = 0, location[3] = {};
-    uintptr_t callerRva = 0;
-    uint32_t locationIndex = 0;
-    int callerAuthority = -1, precondition = -1;
-    bool fromPromotion = false, fromBiome = false, accepted = false, readable = false;
-};
-static thread_local Sample* currentRequest = nullptr;
-static SRWLOCK sampleLock = SRWLOCK_INIT;
-static Sample samples[32];
-static unsigned sampleCount = 0;
-struct BiomeSample {
-    // 0 = root builder, 1 = cell builder, 2 = native instance, 3 = queued job.
-    int stage = 0, builderType = -1, enabled = -1, mode = -1, previousLod = -1;
-    uint32_t flags = 0, forwardedFlags = 0, lod = 0;
-    int jobEligible = -1;
-    uint32_t jobFlags = 0;
-    bool fromJob = false;
-    uint64_t providerHandle = 0, definition = 0, location[3] = {};
-    uint32_t locationIndex = 0;
-    bool readable = false;
-};
-static BiomeSample biomeSamples[4][8];
-static unsigned biomeSampleCount[4] = {};
-static thread_local const BiomeSample* currentBiomeJob = nullptr;
-static DWORD loggedAt = 0;
-static uint64_t N(const std::atomic<uint64_t>& n) { return n.load(std::memory_order_relaxed); }
-static void Inc(std::atomic<uint64_t>& n) { n.fetch_add(1, std::memory_order_relaxed); }
-
-static void ObserveObject(uintptr_t result) {
-    __try {
-        Inc(objects);
-        const uintptr_t kindPtr = result ? Rd<uintptr_t>(result + 0x30) : 0;
-        const unsigned kind = kindPtr ? Rd<uint8_t>(kindPtr) : 7;
-        Inc(kinds[kind < 7 ? kind : 7]);
-        if (kind == 5 && (Rd<uintptr_t>(result + 0x48) || Rd<uintptr_t>(result + 0x50))) Inc(withGeometry);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Inc(faults); }
-}
-static void ReadSample(Sample& s, uintptr_t provider, uintptr_t instance, uintptr_t authority) {
-    __try {
-        s.providerHandle = Rd<uint64_t>(provider + 8);
-        s.definition = Rd<uintptr_t>(instance + 0x18);
-        memcpy(s.location, reinterpret_cast<const void*>(instance + 0x90), sizeof(s.location));
-        s.locationIndex = Rd<uint32_t>(instance + 0xa8);
-        s.callerAuthority = authority ? Rd<uint8_t>(authority) : -1;
-        s.readable = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Inc(faults); }
-}
-static void StoreSample(const Sample& s) {
-    if (!TryAcquireSRWLockExclusive(&sampleLock)) { Inc(dropped); return; }
-    if (sampleCount < _countof(samples)) samples[sampleCount++] = s;
-    else Inc(dropped);
-    ReleaseSRWLockExclusive(&sampleLock);
-}
-static void StoreBiome(const BiomeSample& s) {
-    if (!TryAcquireSRWLockExclusive(&sampleLock)) { Inc(biomeDropped); return; }
-    unsigned& count = biomeSampleCount[s.stage];
-    if (count < _countof(biomeSamples[0])) biomeSamples[s.stage][count++] = s;
-    else Inc(biomeDropped);
-    ReleaseSRWLockExclusive(&sampleLock);
-}
-static void ReadBiomeContext(BiomeSample& s, uintptr_t builder, uintptr_t cell) {
-    __try {
-        s.builderType = Rd<int>(builder + 8);
-        s.enabled = Rd<uint8_t>(builder + 0x28);
-        if (cell) s.previousLod = Rd<int>(cell + 0x16a8);
-        s.readable = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Inc(faults); }
-}
-static void ReadBiomeInstance(BiomeSample& s, uintptr_t instance, uintptr_t provider) {
-    __try {
-        s.providerHandle = Rd<uint64_t>(provider);
-        s.definition = Rd<uintptr_t>(instance + 0x18);
-        memcpy(s.location, reinterpret_cast<const void*>(instance + 0x90), sizeof(s.location));
-        s.locationIndex = Rd<uint32_t>(instance + 0xa8);
-        s.readable = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Inc(faults); }
-}
-// Read immutable-address context flags at the decision, not just the previous UI tick.
-static bool NearbyContextAllowed() {
-    __try {
-        return g_natural.online && *g_natural.online == 0 && g_natural.editor && *g_natural.editor == 0
-            && g_natural.server && *g_natural.server == 1;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { nearbyFaulted.store(true); return false; }
-}
-static uint32_t NearbyFlags(const BiomeSample& s) {
-    // Only the observed type-0 client draw/physics work, at native close LODs.
-    // Retain native provider validation, location/depletion checks, batch and LOD writes.
-    if (!nearbyEnabled.load(std::memory_order_relaxed) || nearbyFaulted.load(std::memory_order_relaxed)
-        || !s.readable || s.builderType != 0 || s.enabled != 1 || s.flags != 6
-        || s.lod > 1 || s.previousLod < 2 || s.previousLod > 100 || !NearbyContextAllowed()) return s.flags;
-    return s.flags | 8;
-}
-static void __fastcall BiomeJobHook(uintptr_t context) {
-    if (!active.load(std::memory_order_relaxed)) { biomeJob(context); return; }
-    Inc(biomeJobs);
-    BiomeSample s; s.stage = 3;
-    __try {
-        s.flags = Rd<uint32_t>(context + 0x10);
-        s.lod = Rd<uint32_t>(context + 0x20);
-        s.jobEligible = Rd<uint8_t>(context + 0x38);
-        ReadBiomeContext(s, Rd<uintptr_t>(context + 0x58), Rd<uintptr_t>(context + 0x28));
-    } __except (EXCEPTION_EXECUTE_HANDLER) { Inc(faults); }
-    if (s.readable) {
-        if (s.flags & 8) { Inc(biomeJobsWithSpawn); if (!s.jobEligible) Inc(biomeJobsBlocked); }
-        if (s.jobEligible) Inc(biomeJobsEligible);
-    }
-    StoreBiome(s);
-    const BiomeSample* previous = currentBiomeJob;
-    currentBiomeJob = &s;
-    __try { biomeJob(context); }
-    __finally { currentBiomeJob = previous; }
-}
-static void __fastcall BiomeBuildHook(uintptr_t builder, uintptr_t planet, uint32_t flags) {
-    if (active.load(std::memory_order_relaxed)) {
-        Inc(biomeBuilds);
-        if (flags & 8) Inc(biomeBuildWithSpawn);
-        BiomeSample s; s.flags = flags;
-        ReadBiomeContext(s, builder, 0); StoreBiome(s);
-    }
-    biomeBuild(builder, planet, flags);
-}
-static void __fastcall BiomeCellHook(uintptr_t builder, uintptr_t cell, uintptr_t planet, uint32_t lod, uint32_t flags, uint64_t page, uint8_t option) {
-    uint32_t forwarded = flags;
-    if (active.load(std::memory_order_relaxed) || nearbyEnabled.load(std::memory_order_relaxed)) {
-        Inc(biomeCells);
-        if (flags & 8) Inc(biomeCellWithSpawn);
-        BiomeSample s; s.stage = 1; s.flags = flags; s.lod = lod;
-        ReadBiomeContext(s, builder, cell);
-        if (s.readable && s.previousLod >= 2 && lod <= 1) Inc(biomeNearCells);
-        if (currentBiomeJob && currentBiomeJob->readable) {
-            s.fromJob = true; s.jobFlags = currentBiomeJob->flags; s.jobEligible = currentBiomeJob->jobEligible;
-        }
-        forwarded = NearbyFlags(s);
-        s.forwardedFlags = forwarded;
-        if (forwarded != flags) Inc(biomePromoted);
-        StoreBiome(s);
-    }
-    biomeCell(builder, cell, planet, lod, forwarded, page, option);
-}
-static void __fastcall BiomeInstanceHook(uintptr_t context, uintptr_t instance, uintptr_t provider, int mode,
-    uint32_t group, uintptr_t output, uintptr_t count, uintptr_t extra, uintptr_t batch) {
-    if (!active.load(std::memory_order_relaxed)) { biomeInstance(context, instance, provider, mode, group, output, count, extra, batch); return; }
-    if (mode >= 0 && mode < 4) Inc(biomeModes[mode]); else Inc(biomeOtherModes);
-    BiomeSample s; s.stage = 2; s.mode = mode;
-    if (mode == 0 || mode == 1) ReadBiomeInstance(s, instance, provider);
-    StoreBiome(s);
-    ++biomeDepth;
-    __try { biomeInstance(context, instance, provider, mode, group, output, count, extra, batch); }
-    __finally { --biomeDepth; }
-}
-static void __fastcall PromotionHook(uintptr_t context) {
-    if (!active.load(std::memory_order_relaxed)) { promotion(context); return; }
-    Inc(jobs);
-    ++promotionDepth;
-    __try { promotion(context); }
-    __finally { --promotionDepth; }
-}
-static uintptr_t __fastcall ObjectHook(uintptr_t out, uintptr_t context, uintptr_t index, uintptr_t world) {
-    const uintptr_t result = object(out, context, index, world);
-    if (promotionDepth) ObserveObject(result);
-    return result;
-}
-static bool __fastcall CheckHook(uintptr_t provider, uintptr_t instance, uintptr_t authority) {
-    const bool result = check(provider, instance, authority);
-    if (currentRequest) currentRequest->precondition = result ? 1 : 0;
-    return result;
-}
-static bool __fastcall RequestHook(uintptr_t provider, uintptr_t instance, uintptr_t batch, uintptr_t authority) {
-    if (!active.load(std::memory_order_relaxed)) return request(provider, instance, batch, authority);
-    Sample s;
-    s.callerRva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_api.base;
-    s.fromPromotion = promotionDepth != 0;
-    s.fromBiome = biomeDepth != 0;
-    ReadSample(s, provider, instance, authority);
-    Inc(requests);
-    if (s.fromPromotion) Inc(promotionRequests);
-    if (s.fromBiome) Inc(biomeRequests);
-    Sample* previous = currentRequest;
-    currentRequest = &s;
-    __try { s.accepted = request(provider, instance, batch, authority); }
-    __finally { currentRequest = previous; }
-    if (s.accepted) Inc(accepted);
-    else if (s.precondition == 0) Inc(rejected);
-    else if (s.precondition < 0) Inc(unchecked);
-    else Inc(afterCheck);
-    StoreSample(s);
-    return s.accepted;
-}
-static void Install(uintptr_t base) {
-    // Stolen spans contain only whole, non-relative instructions (see research).
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x2639070), 7, reinterpret_cast<void*>(&PromotionHook), reinterpret_cast<void**>(&promotion))) installed |= 1;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x26d2250), 5, reinterpret_cast<void*>(&ObjectHook), reinterpret_cast<void**>(&object))) installed |= 2;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x3d18b20), 5, reinterpret_cast<void*>(&RequestHook), reinterpret_cast<void**>(&request))) installed |= 4;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x3cd3990), 6, reinterpret_cast<void*>(&CheckHook), reinterpret_cast<void**>(&check))) installed |= 8;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x2652ce0), 7, reinterpret_cast<void*>(&BiomeBuildHook), reinterpret_cast<void**>(&biomeBuild))) installed |= 16;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x26593c0), 5, reinterpret_cast<void*>(&BiomeCellHook), reinterpret_cast<void**>(&biomeCell))) installed |= 32;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x273c180), 5, reinterpret_cast<void*>(&BiomeInstanceHook), reinterpret_cast<void**>(&biomeInstance))) installed |= 64;
-    if (HookFunction(reinterpret_cast<uint8_t*>(base + 0x263e3e0), 5, reinterpret_cast<void*>(&BiomeJobHook), reinterpret_cast<void**>(&biomeJob))) installed |= 128;
-    Log("[dev/mining/promotion-probe] installed=0x%x complete=%d; counts cover enabled experiment / mining traces; accepted is not completed entity creation", installed, installed == completeMask);
-}
-static void LogCounts(DWORD now) {
-    loggedAt = now;
-    Log("[dev/mining/promotion-probe] installed=0x%x active=%d jobs=%llu objects=%llu kind1=%llu kind4=%llu kind5=%llu kindOther=%llu geometry5=%llu requests=%llu fromPromotion=%llu accepted=%llu rejectedCheck=%llu rejectedBeforeCheck=%llu rejectedAfterCheck=%llu readFaults=%llu droppedSamples=%llu",
-        installed, active.load(), N(jobs), N(objects), N(kinds[1]), N(kinds[4]), N(kinds[5]),
-        N(kinds[0]) + N(kinds[2]) + N(kinds[3]) + N(kinds[6]) + N(kinds[7]), N(withGeometry),
-        N(requests), N(promotionRequests), N(accepted), N(rejected), N(unchecked), N(afterCheck), N(faults), N(dropped));
-    Sample copied[32];
-    AcquireSRWLockExclusive(&sampleLock);
-    const unsigned count = sampleCount;
-    memcpy(copied, samples, count * sizeof(Sample));
-    sampleCount = 0;
-    ReleaseSRWLockExclusive(&sampleLock);
-    for (unsigned i = 0; i < count; ++i) {
-        const auto& s = copied[i];
-        Log("[dev/mining/promotion-request] callerRva=0x%llx fromPromotion=%d fromBiome=%d readable=%d providerHandle=0x%llx definition=0x%llx location=(%llu,%llu,%llu,%u) callerAuthority=%d precondition=%d accepted=%d",
-            s.callerRva, s.fromPromotion, s.fromBiome, s.readable, s.providerHandle, s.definition,
-            s.location[0], s.location[1], s.location[2], s.locationIndex, s.callerAuthority, s.precondition, s.accepted);
-    }
-    Log("[dev/mining/biome-probe] builds=%llu buildsWithSpawnBit=%llu cells=%llu cellsWithSpawnBit=%llu nearCells=%llu mode0_draw=%llu mode1_spawn=%llu mode2=%llu mode3=%llu otherModes=%llu requests=%llu droppedSamples=%llu",
-        N(biomeBuilds), N(biomeBuildWithSpawn), N(biomeCells), N(biomeCellWithSpawn), N(biomeNearCells),
-        N(biomeModes[0]), N(biomeModes[1]), N(biomeModes[2]), N(biomeModes[3]), N(biomeOtherModes), N(biomeRequests), N(biomeDropped));
-    Log("[dev/mining/biome-scheduling] jobs=%llu withSpawnBit=%llu eligible=%llu spawnBitBlocked=%llu nearbyEnabled=%d promotedCells=%llu contextFault=%d",
-        N(biomeJobs), N(biomeJobsWithSpawn), N(biomeJobsEligible), N(biomeJobsBlocked), nearbyEnabled.load(), N(biomePromoted), nearbyFaulted.load());
-    BiomeSample copiedBiome[4][8]; unsigned counts[4];
-    AcquireSRWLockExclusive(&sampleLock);
-    memcpy(copiedBiome, biomeSamples, sizeof(copiedBiome));
-    memcpy(counts, biomeSampleCount, sizeof(counts));
-    memset(biomeSampleCount, 0, sizeof(biomeSampleCount));
-    ReleaseSRWLockExclusive(&sampleLock);
-    for (int stage = 0; stage < 4; ++stage) for (unsigned i = 0; i < counts[stage]; ++i) {
-        const auto& s = copiedBiome[stage][i];
-        Log("[dev/mining/biome-sample] stage=%d readable=%d builderType=%d enabled=%d flags=0x%x forwardedFlags=0x%x lod=%u previousHarvestableLod=%d mode=%d fromJob=%d jobFlags=0x%x jobEligible=%d providerHandle=0x%llx definition=0x%llx location=(%llu,%llu,%llu,%u)",
-            s.stage, s.readable, s.builderType, s.enabled, s.flags, s.forwardedFlags, s.lod, s.previousLod, s.mode,
-            s.fromJob, s.jobFlags, s.jobEligible, s.providerHandle, s.definition, s.location[0], s.location[1], s.location[2], s.locationIndex);
-    }
-}
-} // namespace NaturalProbe
-
-static void LogNaturalEnvironment() {
-    int server = -1, editor = -1, online = -1;
-    __try {
-        if (g_api.base) {
-            server = Rd<uint8_t>(g_api.base + 0x9e2e908);
-            editor = Rd<uint8_t>(g_api.base + 0x9e2ec66);
-            online = Rd<uint8_t>(g_api.base + 0x9e2ec6e);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { server = editor = online = -1; }
-    Log("[dev/mining/environment] server=%d editor=%d online=%d", server, editor, online);
-    const char* names[] = { "ec_harvestable.spawning_enabled", "ec_harvestable.log_spawns", "w_PlanetsideEntitySpawning",
-        "w_PlanetV5_ForceLoadPlanetAsV5HybridMode", "w_Scattering_UseCPUVirtualCache", "w_Scattering_GPUScattering",
-        "w_Scattering_PromotionSubdivisionLevel", "w_Scattering_ServerTestMode", "g_PlanetSpawnMineables" };
-    for (const char* name : names) {
-        float value = 0;
-        if (GetCVarNow(name, value)) Log("[dev/mining/cvar] name=%s known=1 value=%g", name, value);
-        else Log("[dev/mining/cvar] name=%s known=0", name);
-    }
-}
-
 const char* DevRockClass(int fixture) { return fixture >= 0 && fixture < 2 ? kRocks[fixture] : ""; }
 
 static void Publish() {
@@ -389,97 +88,6 @@ static void Status(const char* fmt, ...) {
     Log("[dev/mining] %s", g_state.status);
 }
 
-static bool SetNaturalPromotion(bool enable) {
-    if (enable && (!g_state.nativeReady || !g_state.naturalReady || !g_natural.editor || !g_natural.online)) {
-        Status("Natural promotion unavailable: executable/context checks have not passed."); return false;
-    }
-    if (enable && (*g_natural.online || *g_natural.editor)) {
-        Status("Natural promotion is restricted to offline play outside the editor."); return false;
-    }
-    if (g_state.naturalEnabled == enable) return true;
-    uint8_t expected[sizeof(kNaturalGate)];
-    memcpy(expected, kNaturalGate, sizeof(expected));
-    expected[7] = g_state.naturalEnabled ? 0xff : 0;
-    if (!g_natural.gate || memcmp(g_natural.gate, expected, sizeof(expected)) != 0) {
-        g_state.naturalReady = false;
-        g_natural.restoreFailed = g_state.naturalEnabled;
-        Status("Natural promotion code changed unexpectedly. No write performed; restart before retrying."); return false;
-    }
-    // Native cache contains IsEditor (0/1). Comparing against 0xff makes only
-    // this gate pass; provider validity, geometry and creation-batch checks stay.
-    const uint8_t value = enable ? 0xff : 0;
-    DWORD error = 0;
-    if (!WriteCode(g_natural.gate + 7, &value, 1, error)) {
-        g_natural.restoreFailed = g_state.naturalEnabled;
-        Status("Natural promotion %s failed (error %lu).%s", enable ? "enable" : "restore", error,
-            g_state.naturalEnabled ? " Restart the game before continuing." : "");
-        return false;
-    }
-    g_natural.restoreFailed = false;
-    g_state.naturalEnabled = enable;
-    Log("[dev/mining/natural] enabled=%d editor=%d online=%d gateRva=0x263984a immediate=0x%02x",
-        enable, *g_natural.editor, *g_natural.online, value);
-    Status(enable ? "Natural promotion experiment enabled. Enable before travelling to the test area; inspect markers there to save promotion counters."
-        : "Natural promotion experiment disabled. Existing entities keep their native lifetime; future promotions use the original gate.");
-    return true;
-}
-
-static bool SetNearbySpawning(bool enable) {
-    if (enable && (!g_state.nativeReady || !g_state.naturalProbeReady || !g_tp.ok || !SpawnerReady()
-        || NaturalProbe::nearbyFaulted.load() || !NaturalProbe::NearbyContextAllowed())) {
-        Status("Nearby biome spawning unavailable: native probes and offline/server context must pass. Restart after a context fault.");
-        return false;
-    }
-    g_state.nearbyEnabled = enable;
-    NaturalProbe::nearbyEnabled.store(enable);
-    Log("[dev/mining/nearby] enabled=%d; eligible type-0 cells: flags 0x6 -> 0xe, requested LOD 0/1, previous LOD 2..100", enable);
-    Status(enable ? "Nearby biome spawning experiment enabled. Travel to a new ore area, inspect markers and try normal mining."
-        : "Nearby biome spawning disabled. Submitted work and existing entities retain native lifetime handling.");
-    return true;
-}
-
-static void CheckNaturalContext() {
-    if (g_state.nearbyEnabled && (!g_state.nativeReady || !g_state.naturalProbeReady || !g_tp.ok || !SpawnerReady()
-        || NaturalProbe::nearbyFaulted.load() || !NaturalProbe::NearbyContextAllowed())) SetNearbySpawning(false);
-    __try {
-        if (g_state.naturalEnabled && !g_natural.restoreFailed
-            && (!g_state.nativeReady || !g_tp.ok || !SpawnerReady() || *g_natural.online || *g_natural.editor))
-            SetNaturalPromotion(false);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_natural.restoreFailed = true;
-        g_state.naturalReady = false;
-        Status("Natural promotion context/restore fault. Restart the game before continuing.");
-    }
-}
-
-static bool ExecutableMatches() {
-    wchar_t path[32768];
-    const DWORD len = GetModuleFileNameW(nullptr, path, _countof(path));
-    if (!len || len >= _countof(path)) return false;
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    BYTE* buffer = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), 0, 1024 * 1024));
-    bool ok = buffer && BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0
-        && BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0;
-    while (ok) {
-        DWORD read = 0;
-        if (!ReadFile(file, buffer, 1024 * 1024, &read, nullptr)) { ok = false; break; }
-        if (!read) break;
-        ok = BCryptHashData(hash, buffer, read, 0) == 0;
-    }
-    BYTE digest[32] = {};
-    if (ok) ok = BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
-    char hex[65] = {};
-    if (ok) for (int i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", digest[i]);
-    if (hash) BCryptDestroyHash(hash);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    if (buffer) HeapFree(GetProcessHeap(), 0, buffer);
-    CloseHandle(file);
-    return ok && strcmp(hex, kGameHash) == 0;
-}
-
 static bool CheckNativeCode() {
     const struct { uintptr_t rva; const char* bytes; } checks[] = {
         { 0x33591e0, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48" },
@@ -497,16 +105,6 @@ static bool CheckNativeCode() {
         { 0x33bc910, "40 55 57 48 83 EC 38 48 8D 05 52 73 21 05 48 89" },
         { 0x609e590, "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57" },
         { 0x609e4c0, "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83" },
-        { 0x2639070, "40 53 56 41 55 41 56 48 81 EC 88 0C 00 00 33 F6" },
-        { 0x26396d2, "0F B6 05 8D 55 7F 07" },
-        { 0x2639843, "80 BC 24 A0 03 00 00 00 0F 84 D0 01 00 00" },
-        { 0x26d2250, "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 20 55" },
-        { 0x3d18b20, "4C 89 4C 24 20 4C 89 44 24 18 48 89 4C 24 08 55" },
-        { 0x3cd3990, "40 55 53 56 41 55 48 8D AC 24 08 FF FF FF 48 81" },
-        { 0x2652ce0, "48 8B C4 44 89 40 18 48 89 48 08 53 56 57 41 54" },
-        { 0x26593c0, "44 89 4C 24 20 4C 89 44 24 18 48 89 54 24 10 48" },
-        { 0x273c180, "4C 8B DC 55 56 41 56 48 81 EC E0 00 00 00 4D 8B" },
-        { 0x263e3e0, "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C" },
     };
     __try {
         for (const auto& check : checks) {
@@ -520,7 +118,7 @@ static bool CheckNativeCode() {
 void ResolveDevApi() {
     g_api.base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     g_state.spawnerReady = SpawnerReady();
-    g_state.nativeReady = ExecutableMatches() && CheckNativeCode();
+    g_state.nativeReady = MiningBuildVerified() && CheckNativeCode();
     if (g_state.nativeReady) {
         g_api.add = reinterpret_cast<QueueContactFn>(g_api.base + 0x33591e0);
         g_api.remove = reinterpret_cast<RemoveContactFn>(g_api.base + 0x3356460);
@@ -536,15 +134,6 @@ void ResolveDevApi() {
         g_api.forEachEntry = reinterpret_cast<ForEachEntryFn>(g_api.base + 0x33bc910);
         g_api.scanEntry = reinterpret_cast<TargetEntryFn>(g_api.base + 0x609e590);
         g_api.scanEntity = reinterpret_cast<TargetEntityFn>(g_api.base + 0x609e4c0);
-        NaturalProbe::Install(g_api.base);
-        g_state.naturalProbeReady = NaturalProbe::installed == NaturalProbe::completeMask;
-        if (g_isOnlineFlag == reinterpret_cast<const uint8_t*>(g_api.base + 0x9e2ec6e)) {
-            g_natural.gate = reinterpret_cast<uint8_t*>(g_api.base + 0x2639843);
-            g_natural.editor = reinterpret_cast<const uint8_t*>(g_api.base + 0x9e2ec66);
-            g_natural.online = g_isOnlineFlag;
-            g_natural.server = reinterpret_cast<const uint8_t*>(g_api.base + 0x9e2e908);
-            g_state.naturalReady = true;
-        }
         strcpy_s(g_state.apiStatus, "Native contact adapter: executable fingerprint and code checks passed.");
     } else {
         strcpy_s(g_state.apiStatus, "Native contact adapter unavailable: executable fingerprint or code checks differ. Generic spawning is still available.");
@@ -773,9 +362,9 @@ static void InspectMarkers() {
     uint64_t owners[3] = {};
     const int banks = CurrentBanks(owners);
     const EntryVisitor visitor = { &CollectMarker, 1, nullptr };
-    Log("[dev/mining/markers] begin banks=%d naturalPromotion=%d; sampling provider/location keys (type 2)", banks, g_state.naturalEnabled);
-    if (g_natural.editor && g_natural.online)
-        Log("[dev/mining/natural] enabled=%d editor=%d online=%d", g_state.naturalEnabled, *g_natural.editor, *g_natural.online);
+    MiningSnapshot mining;
+    GetMiningSnapshot(mining);
+    Log("[dev/mining/markers] begin banks=%d naturalMining=%d; sampling provider/location keys (type 2)", banks, mining.active);
     for (int i = 0; i < banks; ++i) {
         const uintptr_t bank = Databank(owners[i]);
         if (!bank) continue;
@@ -893,10 +482,6 @@ static void Tick(DevAction action, int fixture, float distance, float scale, DWO
         if (action == DevAction::SpawnRock) Spawn(fixture, distance, scale, now);
         else if (action == DevAction::EnableContact) EnableContact();
         else if (action == DevAction::RemoveRock) Remove(now);
-        else if (action == DevAction::EnableNearby) SetNearbySpawning(true);
-        else if (action == DevAction::DisableNearby) SetNearbySpawning(false);
-        else if (action == DevAction::EnableNatural) SetNaturalPromotion(true);
-        else if (action == DevAction::DisableNatural) SetNaturalPromotion(false);
         else if (action == DevAction::InspectMarkers) {
             InspectMarkers();
             if (g_state.markersInspected) Status("Marker inspection saved to mod.log: %d samples, %d live, %d mineable%s. Banks may share entries.",
@@ -968,11 +553,9 @@ static void Tick(DevAction action, int fixture, float distance, float scale, DWO
 }
 
 void ProcessDev(DWORD now) {
-    const bool wasObserving = NaturalProbe::active.load(std::memory_order_relaxed);
-    CheckNaturalContext();
     if (!g_tp.ok || !SpawnerReady()) {
-        NaturalProbe::active.store(false, std::memory_order_relaxed);
-        if (wasObserving) NaturalProbe::LogCounts(now);
+        ProcessMining(now, false);
+        GetMiningSnapshot(g_state.mining);
         Publish(); return;
     }
     AcquireSRWLockExclusive(&g_lock);
@@ -981,29 +564,7 @@ void ProcessDev(DWORD now) {
     if (request.action != DevAction::None) g_published.busy = true;
     ReleaseSRWLockExclusive(&g_lock);
     Tick(request.action, request.fixture, request.distance, request.scale, now);
-    CheckNaturalContext();
-    const bool observing = g_state.nativeReady && g_state.naturalProbeReady
-        && (g_state.naturalEnabled || g_state.nearbyEnabled || g_state.tracing)
-        && g_natural.online && !*g_natural.online && g_natural.editor && !*g_natural.editor;
-    NaturalProbe::active.store(observing, std::memory_order_relaxed);
-    if (g_state.nativeReady && (request.action == DevAction::InspectMarkers || request.action == DevAction::EnableNatural || request.action == DevAction::EnableNearby
-        || request.action == DevAction::StartTrace || request.action == DevAction::Refresh)) LogNaturalEnvironment();
-    if (request.action == DevAction::InspectMarkers || request.action == DevAction::Refresh
-        || request.action == DevAction::EnableNatural || request.action == DevAction::DisableNatural
-        || request.action == DevAction::EnableNearby || request.action == DevAction::DisableNearby
-        || request.action == DevAction::StartTrace || request.action == DevAction::StopTrace
-        || (wasObserving && !observing)
-        || (observing && now - NaturalProbe::loggedAt >= (g_state.tracing ? 1000u : 5000u)))
-        NaturalProbe::LogCounts(now);
-    g_state.promotionJobs = NaturalProbe::N(NaturalProbe::jobs);
-    g_state.promotionHarvestables = NaturalProbe::N(NaturalProbe::kinds[5]);
-    g_state.promotionRequests = NaturalProbe::N(NaturalProbe::promotionRequests);
-    g_state.harvestableRequests = NaturalProbe::N(NaturalProbe::requests);
-    g_state.harvestableAccepted = NaturalProbe::N(NaturalProbe::accepted);
-    g_state.biomeBuilds = NaturalProbe::N(NaturalProbe::biomeBuilds);
-    g_state.biomeCells = NaturalProbe::N(NaturalProbe::biomeCells);
-    g_state.biomeDraws = NaturalProbe::N(NaturalProbe::biomeModes[0]);
-    g_state.biomeSpawns = NaturalProbe::N(NaturalProbe::biomeModes[1]);
-    g_state.biomePromoted = NaturalProbe::N(NaturalProbe::biomePromoted);
+    ProcessMining(now, g_state.tracing);
+    GetMiningSnapshot(g_state.mining);
     Publish();
 }

@@ -1,9 +1,10 @@
 #pragma once
 #include "common.h"
+#include "mining.h"
 
 // Temporary experiments. Requests cross from the menu thread to the game thread;
 // the menu only reads a copied snapshot and never holds engine pointers.
-enum class DevAction { None, SpawnRock, EnableContact, RemoveRock, Refresh, StartTrace, StopTrace, InspectMarkers, EnableNatural, DisableNatural, EnableNearby, DisableNearby };
+enum class DevAction { None, SpawnRock, EnableContact, RemoveRock, Refresh, StartTrace, StopTrace, InspectMarkers };
 struct DevRockMetrics {
     uint64_t id = 0;
     char name[96] = {};
@@ -38,11 +39,7 @@ struct DevSnapshot {
     bool tracing = false;
     int markerSamples = 0, markerLive = 0, markerMineable = 0;
     bool markersInspected = false, markerTruncated = false;
-    bool naturalReady = false, naturalEnabled = false;
-    bool naturalProbeReady = false, nearbyEnabled = false;
-    uint64_t promotionJobs = 0, promotionHarvestables = 0, promotionRequests = 0;
-    uint64_t harvestableRequests = 0, harvestableAccepted = 0;
-    uint64_t biomeBuilds = 0, biomeCells = 0, biomeDraws = 0, biomeSpawns = 0, biomePromoted = 0;
+    MiningSnapshot mining;
     char status[256] = "Spawn a rock and try normal scanning. The contact button is an optional fallback.";
     char apiStatus[160] = "Waiting for the offline mod to initialize.";
 };

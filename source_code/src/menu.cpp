@@ -911,8 +911,14 @@ static void DrawDevTab() {
     static float scale = 0.5f;
     DevSnapshot state;
     Menu_DevSnapshot(state);
-    Section("Mining experiment");
-    Hint("Temporary DEV tools: spawn one known rock and test normal scanning / mining.");
+    Section("Natural mining");
+    if (state.mining.faulted) Hint("Natural spawning stopped after a native read fault. Restart the game; details are in mod.log.");
+    else if (state.mining.active) Hint("Natural rock spawning is active automatically. No DEV action is needed.");
+    else if (state.mining.hookReady) Hint("Natural spawning is waiting for the offline game context.");
+    else Hint("Natural spawning is unavailable for this game build. Check mod.log.");
+    ImGui::Text("Terrain cells given spawning work: %llu", state.mining.promoted);
+    Section("Test rock");
+    Hint("Spawn one known fixture for troubleshooting scanning and mining.");
     ImGui::SetNextItemWidth(-1);
     if (ImGui::Combo("##devRock", &fixture, "Iron (ship mining)\0Hadanite (FPS mining)\0")) {
         distance = fixture == 0 ? 25.0f : 8.0f;
@@ -944,24 +950,6 @@ static void DrawDevTab() {
         Menu_RequestDev(state.tracing ? DevAction::StopTrace : DevAction::StartTrace);
     if (PrimaryButton("Inspect natural markers")) Menu_RequestDev(DevAction::InspectMarkers);
     ImGui::EndDisabled();
-    ImGui::BeginDisabled(state.busy || (!state.nearbyEnabled && (!state.naturalProbeReady || !state.nativeReady)));
-    if (PrimaryButton(state.nearbyEnabled ? "Disable nearby biome spawning" : "Enable nearby biome spawning"))
-        Menu_RequestDev(state.nearbyEnabled ? DevAction::DisableNearby : DevAction::EnableNearby);
-    ImGui::EndDisabled();
-    Hint("New experiment: let nearby terrain cells create their native harvestables. Enable before travelling to ore, then inspect markers and try mining. Resets off on restart.");
-    ImGui::BeginDisabled(state.busy || (!state.naturalEnabled && (!state.naturalReady || !state.nativeReady)));
-    if (PrimaryButton(state.naturalEnabled ? "Disable older V5 promotion experiment" : "Enable older V5 promotion experiment"))
-        Menu_RequestDev(state.naturalEnabled ? DevAction::DisableNatural : DevAction::EnableNatural);
-    ImGui::EndDisabled();
-    Hint("The older V5 experiment did not affect the observed Terminus path. Leave it off for the nearby biome test.");
-    if (state.naturalProbeReady) {
-        ImGui::Text("Promotion jobs: %llu / harvestable candidates: %llu / requests: %llu", state.promotionJobs, state.promotionHarvestables, state.promotionRequests);
-        ImGui::Text("All harvestable requests: %llu / accepted: %llu", state.harvestableRequests, state.harvestableAccepted);
-        ImGui::Text("Biome builds: %llu / cells: %llu", state.biomeBuilds, state.biomeCells);
-        ImGui::Text("Cells given spawning work: %llu", state.biomePromoted);
-        ImGui::Text("Biome harvestables: %llu drawing / %llu spawning", state.biomeDraws, state.biomeSpawns);
-        Hint("Counts accumulate while the experiment or a mining trace is active. An accepted request still needs to produce a live entity.");
-    } else Hint("Promotion observers unavailable; zero counters would not establish that the native path was idle.");
     if (state.tracing) ImGui::Text("Recording: %d seconds remaining", state.traceSeconds);
     Hint("Start a trace from a mining turret, close the menu and fire at a rock. Repeat for a natural rock; it does not need to be spawned here.");
     if (state.markersInspected) {
@@ -970,7 +958,7 @@ static void DrawDevTab() {
     }
     ImGui::Spacing();
     ImGui::TextWrapped("%s", state.status);
-    Section("Diagnostics");
+    Section("Mining diagnostics");
     Hint(state.apiStatus);
     if (state.rockId) {
         ImGui::TextWrapped("Tracked: %s", DevRockClass(state.fixture));

@@ -169,6 +169,7 @@
     <ClCompile Include="npc.cpp" />
     <ClCompile Include="build.cpp" />
     <ClCompile Include="dev.cpp" />
+    <ClCompile Include="mining.cpp" />
     <ClCompile Include="cvars.cpp" />
     <ClCompile Include="missions.cpp" />
     <ClCompile Include="contracts.cpp" />
@@ -197,6 +198,7 @@
     <ClInclude Include="npc.h" />
     <ClInclude Include="build.h" />
     <ClInclude Include="dev.h" />
+    <ClInclude Include="mining.h" />
     <ClInclude Include="cvars.h" />
     <ClInclude Include="missions.h" />
     <ClInclude Include="contracts.h" />
